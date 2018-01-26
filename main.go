@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -12,53 +11,28 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
-
-	"golang.org/x/crypto/blake2b"
 )
 
-func blake2bsum(size int, data string) string {
-	h, _ := blake2b.New(size, nil)
-	fmt.Println(h.Size())
-	h.Write([]byte(data))
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-type helloHandler struct{}
+type ProxyHandler struct{}
 
 type ClientRequest struct {
 	method  string
 	url     url.URL
 	tls     bool
-	headers http.Header
-	reader  io.Reader
-	writer  io.Writer
+	request *http.Request
+	reader  *bufio.Reader
+	writer  *bufio.Writer
 	conn    net.Conn
 }
 
 type ServerResponse struct {
 	request *ClientRequest
-	reader  io.Reader
-	writer  io.Writer
+	reader  *bufio.Reader
+	writer  *bufio.Writer
 	conn    net.Conn
-}
-
-// func MiddleWare(h http.Handler) http.Handler {
-// 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-// 		log.Printf("[%d] %s - %s", getGID(), r.Method, r.URL.Path)
-// 		defer log.Printf("[%d] %s - %s", getGID(), r.Method, r.URL.Path)
-//
-// 		h.ServeHTTP(w, r)
-// 	})
-//
-// 	return handler
-// }
-
-type Error string
-
-func (e Error) Error() string {
-	return string(e)
 }
 
 func sendError(c *ClientRequest, message string, code int) {
@@ -79,52 +53,79 @@ func makeRequest(c *ClientRequest) (*ServerResponse, error) {
 	// Need to re-set the Host header, for some reason it is removed from the client request
 	hostParts := strings.Split(c.url.Host, ":")
 	if hostParts[1] == "80" || hostParts[1] == "443" {
-		c.headers.Set("Host", hostParts[0])
+		c.request.Header.Set("Host", hostParts[0])
 	} else {
-		c.headers.Set("Host", c.url.Host)
+		c.request.Header.Set("Host", c.url.Host)
 	}
 
-	log.Println(c.headers.Get("Host"))
-
+	var conn net.Conn
+	var err error
 	if c.tls {
 		config := tls.Config{InsecureSkipVerify: true}
-		conn, err := tls.Dial("tcp", c.url.Host, &config)
+		conn, err = tls.Dial("tcp", c.url.Host, &config)
 		if err != nil {
 			sendError(c, fmt.Sprintln("Unable to make tls connection", err), http.StatusInternalServerError)
 			return nil, err
 		}
-		s = &ServerResponse{conn: conn, reader: conn, writer: conn}
 	} else {
-		conn, err := net.Dial("tcp", c.url.Host)
+		conn, err = net.Dial("tcp", c.url.Host)
 		if err != nil {
 			sendError(c, fmt.Sprintln("Unable to make connection", err), http.StatusInternalServerError)
 			return nil, err
 		}
-		s = &ServerResponse{conn: conn, reader: conn, writer: conn}
 	}
+	s = &ServerResponse{conn: conn, reader: bufio.NewReader(conn), writer: bufio.NewWriter(conn)}
 	defer s.conn.Close()
 
-	io.WriteString(s.writer, fmt.Sprintf("%s %s HTTP/1.1\r\n", c.method, c.url.RequestURI()))
-	c.headers.Write(s.writer)
-	s.writer.Write([]byte("\r\n"))
+	log.Printf("%s - - \"%s %s %s\"", c.url.Host, c.method, c.url.RequestURI(), c.request.Proto)
 
-	response, err := http.ReadResponse(bufio.NewReader(s.reader), nil)
+	// Write request to the server
+	io.WriteString(s.writer, fmt.Sprintf("%s %s HTTP/1.1\r\n", c.method, c.url.RequestURI()))
+	c.request.Header.Write(s.writer)
+	s.writer.Write([]byte("\r\n"))
+	s.writer.Flush()
+
+	if c.request.Header.Get("Upgrade") != "" {
+		log.Println("[!] Unsupported upgrade!")
+	} else {
+		body, err := ioutil.ReadAll(c.request.Body)
+		if err != nil {
+			sendError(c, fmt.Sprintln("Unable to read response body", err), http.StatusInternalServerError)
+			return nil, err
+		}
+		s.writer.Write(body)
+		s.writer.Flush()
+	}
+
+	response, err := http.ReadResponse(s.reader, c.request)
 	if err != nil {
 		sendError(c, fmt.Sprintln("Unable to read response headers", err), http.StatusInternalServerError)
 		return nil, err
 	}
 
-	io.WriteString(c.writer, fmt.Sprintf("HTTP/1.1 %d %s\r\n", response.StatusCode, response.Status))
+	// Write response to the client
+	io.WriteString(c.writer, fmt.Sprintf("HTTP/1.1 %s\r\n", response.Status))
 	response.Header.Write(c.writer)
 	io.WriteString(c.writer, "\r\n")
+	c.writer.Flush()
 
-	contents, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		sendError(c, fmt.Sprintln("Unable to read response body", err), http.StatusInternalServerError)
-		return nil, err
+	buf := make([]byte, 0, 4096)
+	for {
+		n, err := response.Body.Read(buf[0:4096])
+		if n > 0 {
+			c.writer.Write(buf[:n])
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			} else {
+				log.Println(err)
+				return nil, err
+			}
+		}
 	}
+	c.writer.Flush()
 
-	c.writer.Write(contents)
 	return s, nil
 }
 
@@ -136,7 +137,6 @@ func prepareResponseHeaders(dst, src http.Header) {
 
 	for k, vs := range src {
 		if _, ok := badHeaders[k]; ok {
-			log.Printf("Skipping header %s\n", k)
 			continue
 		}
 		for _, v := range vs {
@@ -147,13 +147,9 @@ func prepareResponseHeaders(dst, src http.Header) {
 	dst.Set("Connection", "Close")
 }
 
-func (h helloHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// log.Println(fmt.Sprintf("Connection %v %v", w, r))
-
+func (h ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
-
 	case "CONNECT":
-		// log.Println("CONNECT")
 		// https: //golang.org/pkg/net/http/#Hijacker
 		hj, ok := w.(http.Hijacker)
 		if !ok {
@@ -186,26 +182,28 @@ func (h helloHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		clientTlsReader := bufio.NewReader(rawClientTls)
-		tlsr, err := http.ReadRequest(clientTlsReader)
+		// s, _ := bufio.NewReader(rawClientTls).Peek(700)
+		// fmt.Println(string(s))
+		reader := bufio.NewReader(rawClientTls)
+		writer := bufio.NewWriter(rawClientTls)
+		tlsr, err := http.ReadRequest(reader)
 		if err != nil {
 			log.Printf("Cannot read tls request %v %v", r.Host, err)
 			return
 		}
 
 		req := ClientRequest{
-			"GET",
-			url.URL{"https", "", nil, r.URL.Host, tlsr.URL.Path, tlsr.URL.RawPath, tlsr.URL.ForceQuery, tlsr.URL.RawQuery, tlsr.URL.Fragment},
-			true,
-			tlsr.Header,
-			rawClientTls,
-			rawClientTls,
-			conn,
+			method:  tlsr.Method,
+			url:     url.URL{"https", "", nil, r.URL.Host, tlsr.URL.Path, tlsr.URL.RawPath, tlsr.URL.ForceQuery, tlsr.URL.RawQuery, tlsr.URL.Fragment},
+			tls:     true,
+			request: tlsr,
+			reader:  reader,
+			writer:  writer,
+			conn:    conn,
 		}
 
 		makeRequest(&req)
 	default:
-		// log.Println(r.Method)
 		if !r.URL.IsAbs() {
 			http.Error(w, fmt.Sprintf("%s method requires absolute URL", r.Method), http.StatusInternalServerError)
 			return
@@ -216,7 +214,7 @@ func (h helloHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Webserver doesn't support hijacking", http.StatusInternalServerError)
 			return
 		}
-		conn, _, err := hj.Hijack()
+		conn, bufrw, err := hj.Hijack()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -231,16 +229,15 @@ func (h helloHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		c := ClientRequest{
-			r.Method,
-			url.URL{"http", "", nil, host, r.URL.Path, r.URL.RawPath, r.URL.ForceQuery, r.URL.RawQuery, r.URL.Fragment},
-			false,
-			r.Header,
-			conn, // Use conn for reader / writer to prevent having to flush all the time
-			conn,
-			conn,
+			method:  r.Method,
+			url:     url.URL{"http", "", nil, host, r.URL.Path, r.URL.RawPath, r.URL.ForceQuery, r.URL.RawQuery, r.URL.Fragment},
+			tls:     false,
+			request: r,
+			reader:  bufrw.Reader,
+			writer:  bufrw.Writer,
+			conn:    conn,
 		}
 
-		// req := Req{*r.URL, bufrw, conn}
 		makeRequest(&c)
 		// fmt.Printf("Response: %v %v\n", s, err)
 	}
@@ -252,8 +249,17 @@ func main() {
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second,
-		Handler:      helloHandler{},
+		Handler:      ProxyHandler{},
 	}
 
-	log.Println(srv.ListenAndServe())
+	go func() {
+		for {
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			log.Printf("Alloc = %v\tTotalAlloc = %v\tSys = %v\tNumGC = %v\t Routines = %v\n", m.Alloc/1024, m.TotalAlloc/1024, m.Sys/1024, m.NumGC, runtime.NumGoroutine())
+			time.Sleep(5 * time.Second)
+		}
+	}()
+
+	srv.ListenAndServe()
 }

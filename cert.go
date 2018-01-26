@@ -106,20 +106,34 @@ func (e CertificateError) Error() string {
 	return string(e)
 }
 
+var ca *tls.Certificate
+var xca *x509.Certificate
+var certStore map[string]*tls.Certificate
+
+func init() {
+	var err error
+
+	_ca, err := tls.X509KeyPair(CA_CERT, CA_KEY)
+	if err != nil {
+		log.Fatalf("failed to load CA certificate: %s", err)
+	}
+	ca = &_ca
+
+	xca, err = x509.ParseCertificate(ca.Certificate[0])
+	if err != nil {
+		log.Fatalf("failed to convert CA certificate to x509: %s", err)
+	}
+
+	certStore = make(map[string]*tls.Certificate)
+}
+
 func getCertificateHook(hostname string, clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	log.Println("GetCertificateHook", hostname, clientHello.ServerName)
 
+	certificate, ok := certStore[hostname]
+	if ok {
+		return certificate, nil
+	}
 	// https://golang.org/src/crypto/tls/generate_cert.go
-	ca, err := tls.X509KeyPair(CA_CERT, CA_KEY)
-	if err != nil {
-		return nil, CertificateError(fmt.Sprintf("failed to load CA certificate: %s", err))
-	}
-
-	xca, err := x509.ParseCertificate(ca.Certificate[0])
-	if err != nil {
-		return nil, CertificateError(fmt.Sprintf("failed to convert CA certificate to x509: %s", err))
-	}
-
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, CertificateError(fmt.Sprintf("failed to generate private key: %s", err))
@@ -158,8 +172,11 @@ func getCertificateHook(hostname string, clientHello *tls.ClientHelloInfo) (*tls
 		return nil, CertificateError(fmt.Sprintf("failed to create certificate: %s", err))
 	}
 
-	return &tls.Certificate{
+	certificate = &tls.Certificate{
 		Certificate: [][]byte{derBytes, ca.Certificate[0]},
 		PrivateKey:  priv,
-	}, nil
+	}
+	certStore[hostname] = certificate
+	log.Printf("CertStore[%d] Caching certificate for: %s\n", len(certStore), hostname)
+	return certificate, nil
 }
