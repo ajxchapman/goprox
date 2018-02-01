@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"runtime"
 	"strings"
@@ -174,35 +175,33 @@ func (h ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			InsecureSkipVerify: true,
 		}
 
-		rawClientTls := tls.Server(conn, config)
-		defer rawClientTls.Close()
+		tlsconn := tls.Server(conn, config)
+		defer tlsconn.Close()
 
-		if err := rawClientTls.Handshake(); err != nil {
+		if err := tlsconn.Handshake(); err != nil {
 			log.Printf("Cannot handshake client %v %v", r.Host, err)
 			return
 		}
 
-		// s, _ := bufio.NewReader(rawClientTls).Peek(700)
-		// fmt.Println(string(s))
-		reader := bufio.NewReader(rawClientTls)
-		writer := bufio.NewWriter(rawClientTls)
-		tlsr, err := http.ReadRequest(reader)
+		reader := bufio.NewReader(tlsconn)
+		writer := bufio.NewWriter(tlsconn)
+		tr, err := http.ReadRequest(reader)
 		if err != nil {
 			log.Printf("Cannot read tls request %v %v", r.Host, err)
 			return
 		}
 
-		req := ClientRequest{
-			method:  tlsr.Method,
-			url:     url.URL{"https", "", nil, r.URL.Host, tlsr.URL.Path, tlsr.URL.RawPath, tlsr.URL.ForceQuery, tlsr.URL.RawQuery, tlsr.URL.Fragment},
+		c := ClientRequest{
+			method:  tr.Method,
+			url:     url.URL{"https", "", nil, r.URL.Host, tr.URL.Path, tr.URL.RawPath, tr.URL.ForceQuery, tr.URL.RawQuery, tr.URL.Fragment},
 			tls:     true,
-			request: tlsr,
+			request: tr,
 			reader:  reader,
 			writer:  writer,
 			conn:    conn,
 		}
 
-		makeRequest(&req)
+		makeRequest(&c)
 	default:
 		if !r.URL.IsAbs() {
 			http.Error(w, fmt.Sprintf("%s method requires absolute URL", r.Method), http.StatusInternalServerError)
@@ -239,7 +238,6 @@ func (h ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		makeRequest(&c)
-		// fmt.Printf("Response: %v %v\n", s, err)
 	}
 }
 
@@ -256,10 +254,14 @@ func main() {
 		for {
 			var m runtime.MemStats
 			runtime.ReadMemStats(&m)
-			log.Printf("Alloc = %v\tTotalAlloc = %v\tSys = %v\tNumGC = %v\t Routines = %v\n", m.Alloc/1024, m.TotalAlloc/1024, m.Sys/1024, m.NumGC, runtime.NumGoroutine())
+			fmt.Fprintf(os.Stderr, "Alloc = %v\tTotalAlloc = %v\tSys = %v\tNumGC = %v\t Routines = %v\n", m.Alloc/1024, m.TotalAlloc/1024, m.Sys/1024, m.NumGC, runtime.NumGoroutine())
 			time.Sleep(5 * time.Second)
 		}
 	}()
 
-	srv.ListenAndServe()
+	log.SetOutput(os.Stdout)
+	err := srv.ListenAndServe()
+	if err != nil {
+		log.Println(err)
+	}
 }
